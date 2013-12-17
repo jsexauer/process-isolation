@@ -304,8 +304,6 @@ class ObjectProxy(Proxy):
         return self.client.call(operator.eq, self, other)
     def __ne__(self, other):
         return self.client.call(operator.ne, self, other)
-    def __ne__(self, other):
-        return self.client.call(operator.ne, self, other)
     def __cmp__(self, other):
         # Although __cmp__ will never be called by python builtins when
         # __lt__ are defined, we include it incase any user code explicitly calls it
