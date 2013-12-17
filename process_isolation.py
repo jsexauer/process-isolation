@@ -1,5 +1,6 @@
 '''Elegant process isolation in pure Python.'''
 
+
 import os
 import sys
 import time
@@ -20,14 +21,15 @@ import operator
 import threading
 import logging
 import cPickle
-
+from multiprocessing.queues import Empty as QueueEmpty
 # TODO moved to file "TODO"
 
 # TEMP DEBUG:
 sys.setrecursionlimit(100)
 
-
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger('process_isolation')
+
 
 class TerminateProcess(BaseException):
     '''This exception is raised within the host to request a graceful
@@ -185,7 +187,7 @@ class ChildProcessSignalHandler(object):
     def _install(cls):
         if not cls._installed:
             cls._installed = True
-            signal.signal(signal.SIGCHLD, cls._handle_sigchld)
+            #signal.signal(signal.SIGCHLD, cls._handle_sigchld)
 
 ChildProcessSignalHandler._install()
 
@@ -279,7 +281,7 @@ class ObjectProxy(Proxy):
         if attrname in ['_prime_id', '_client']:
             return super(ObjectProxy,self).__detattr__(attrname)
         else:
-            return self.client.call(gelattr, self, attrname)
+            return self.client.call(delattr, self, attrname)
 
     # Implement string-like special methods
     def __str__(self):
@@ -346,7 +348,7 @@ class CallableObjectProxy(ObjectProxy):
     # Implement function-like special methods
     def __call__(self, *args, **kwargs):
         return self.client.call(self, *args, **kwargs)
-    
+
 class ExceptionProxy(Exception,ObjectProxy):
     def __init__(self, prime_id, prime_docstring=None):
         ObjectProxy.__init__(self, prime_id, prime_docstring)
@@ -427,6 +429,7 @@ class Server(object):
         self._result_channel = result_channel
         self._prime_by_id = dict()
         self._proxy_by_id = dict()
+        self.terminate_flag = False
 
     def __getstate__(self):
         raise Exception('You attempted to pickle the server object')
@@ -439,81 +442,91 @@ class Server(object):
 
     def loop(self):
         logger.debug('server[%d] loop() starting', os.getpid())
-        terminate_flag = False
-        while not terminate_flag:
+        self.terminate_flag = False
+        while not self.terminate_flag:
+            self.one_loop()
+        logger.debug('server[%d] loop ended', os.getpid())
+
+    def one_loop(self):
+        if not self.terminate_flag:
             # Get the next delegate
-            delegate = self._delegate_channel.get()
-            logger.debug('server[%d] executing: %s', os.getpid(), str(delegate))
-
-            # Attach the delegate to the server environment
-            delegate.attach_to_server(self)
-
-            # Run the delegate and wrap the result
             try:
-                # Run the delegate in the local environment
-                # The delegate will wrap the result itself
-                result = self.wrap(delegate.run_on_server())
-            except TerminateProcess:
-                # This exception indicates that the client requested that we terminate
-                logger.debug('server[%d] caught TerminateProcess', os.getpid())
-                result = True
-                terminate_flag = True
-            except:
-                # Any other exception gets transported back to the client
-                ex_type, ex_value, ex_traceback = sys.exc_info()
-                result = ExceptionalResult(self.wrap(ex_value), traceback.format_exc())
-                logger.debug('Caught on server[%d]: %s', os.getpid(), ex_value)
-                sys.exc_clear()
+                delegate = self._delegate_channel.get_nowait()
+            except QueueEmpty:
+                pass
+            else:
+                logger.debug('server[%d] executing: %s', os.getpid(), str(delegate))
 
-            # Serialize the result
-            try:
-                # Run the delegate in the local environment
-                # The delegate will wrap the result itself
-                result_str = cPickle.dumps(result)
-            except Exception as ex:
-                ex_type, ex_value, ex_traceback = sys.exc_info()
-                result = ExceptionalResult(self.wrap(ex_value), traceback.format_exc())
-                logger.debug('Caught on server[%d] while pickling: %s', os.getpid(), ex_type)
-                sys.exc_clear()
+                # Attach the delegate to the server environment
+                delegate.attach_to_server(self)
 
-                # Serialize the exception that was raised during pickling
+                # Run the delegate and wrap the result
                 try:
-                    # Run the delegate in the local environment 
+                    # Run the delegate in the local environment
+                    # The delegate will wrap the result itself
+                    result = self.wrap(delegate.run_on_server())
+                except TerminateProcess:
+                    # This exception indicates that the client requested that we terminate
+                    logger.debug('server[%d] caught TerminateProcess', os.getpid())
+                    result = True
+                    self.terminate_flag = True
+                except:
+                    # Any other exception gets transported back to the client
+                    ex_type, ex_value, ex_traceback = sys.exc_info()
+                    result = ExceptionalResult(self.wrap(ex_value), traceback.format_exc())
+                    logger.debug('Caught on server[%d]: %s', os.getpid(), ex_value)
+                    sys.exc_clear()
+
+                # Serialize the result
+                try:
+                    # Run the delegate in the local environment
                     # The delegate will wrap the result itself
                     result_str = cPickle.dumps(result)
                 except Exception as ex:
-                    # If a further exception is raised then stop trying to pickle exceptions
-                    message = Exception('While pickling a result of type %s, an exception of type %s '+
-                                        'was thrown, and while pickling that exception, a further '+
-                                        'exception of type %s was thrown.' % \
-                                            (type(result).__name__, ex_type.__name__, sys.exc_type.__name__))
-                    result = ExceptionalResult(message, '')
-                    result_str = cPickle.dumps(result)
-                    logger.debug('Caught on server[%d] while re-pickling: %s', os.getpid(), ex_type)
+                    ex_type, ex_value, ex_traceback = sys.exc_info()
+                    result = ExceptionalResult(self.wrap(ex_value), traceback.format_exc())
+                    logger.debug('Caught on server[%d] while pickling: %s', os.getpid(), ex_type)
                     sys.exc_clear()
 
-            # Send the result to the client
-            logger.debug('server putting %s onto result queue', raw_repr(result))
-            self._result_channel.put(result_str)
+                    # Serialize the exception that was raised during pickling
+                    try:
+                        # Run the delegate in the local environment
+                        # The delegate will wrap the result itself
+                        result_str = cPickle.dumps(result)
+                    except Exception as ex:
+                        # If a further exception is raised then stop trying to pickle exceptions
+                        message = Exception('While pickling a result of type %s, an exception of type %s '+
+                                            'was thrown, and while pickling that exception, a further '+
+                                            'exception of type %s was thrown.' % \
+                                                (type(result).__name__, ex_type.__name__, sys.exc_type.__name__))
+                        result = ExceptionalResult(message, '')
+                        result_str = cPickle.dumps(result)
+                        logger.debug('Caught on server[%d] while re-pickling: %s', os.getpid(), ex_type)
+                        sys.exc_clear()
 
-        logger.debug('server[%d] loop ended', os.getpid())
+                # Send the result to the client
+                logger.debug('server putting %s onto result queue', raw_repr(result))
+                self._result_channel.put(result_str)
+
+
 
     def wrap(self, prime):
-        logger.debug('wrapping %s (id=%d)', str(prime), id(prime))
+        prime_id = int(id(prime))
+        logger.debug('wrapping %s (id=%d)', str(prime), prime_id)
 
-        if id(prime) in self._proxy_by_id:
+        if prime_id in self._proxy_by_id:
             logger.debug('  returning a cached proxy')
             return self._proxy_by_id[id(prime)]
         else:
             wrapped = self.wrap_impl(prime)
             if wrapped is not prime:
-                logger.debug('server created a proxy for prime_id=Ox%x', id(prime))
-                self._prime_by_id[id(prime)] = prime
-                self._proxy_by_id[id(prime)] = wrapped
+                logger.debug('server created a proxy for prime_id=Ox%x', prime_id)
+                self._prime_by_id[prime_id] = prime
+                self._proxy_by_id[prime_id] = wrapped
             return wrapped
 
     def wrap_impl(self, prime):
-        prime_id = id(prime)
+        prime_id = int(id(prime))
         prime_docstring = getattr(prime, '__doc__', None)
 
         function_types = (types.FunctionType,
@@ -528,7 +541,7 @@ class Server(object):
             return prime.value
 
         elif isinstance_any(prime, scalar_types):
-            logger.debug('  not wrapping scalar')
+            logger.debug('  not wrapping scalar=%s' % prime)
             return prime  # indicates that we should return this object by value
 
         elif isinstance_any(prime, function_types):  # do _not_ use callable(...) here
@@ -567,9 +580,9 @@ class Server(object):
                 return ObjectProxy(prime_id, prime_docstring)
 
         # TEMP HACK
-        elif operator.isSequenceType(prime):
-            logger.debug('  not wrapping sequence')
-            return prime  # indicates that we should return this object by value
+        #elif operator.isSequenceType(prime):
+        #    logger.debug('  not wrapping sequence')
+        #    return prime  # indicates that we should return this object by value
 
         else:
             logger.debug('  wrapping as object')
@@ -784,7 +797,7 @@ class Client(object):
             self.state = ClientState.READY
             raise InternalClientError, \
                 'Error in channel.get: '+ex.message, sys.exc_info()[2]
-            
+
 
         # Unpickle the result
         result = cPickle.loads(result_str)
@@ -874,8 +887,15 @@ class Client(object):
                 # process terminated at some point between the last
                 # execute() and the call to terminate()
                 # For now we just ignore this.
-                pass            
+                pass
 
+class FakeProcess(object):
+    def start(self):
+        pass
+    def is_alive(self):
+        return True
+    def pid(self):
+        return os.getpid()
 
 class IsolationContext(object):
     '''Represents a domain for executing code that is isolated from
@@ -918,8 +938,9 @@ class IsolationContext(object):
         response_queue = multiprocessing.Queue()
 
         # Launch the server process
-        server = Server(request_queue, response_queue)  # Do not keep a reference to this object!
-        server_process = multiprocessing.Process(target=server.loop)
+        self.server = Server(request_queue, response_queue)  # Do not keep a reference to this object!
+        #server_process = multiprocessing.Process(target=server.loop)
+        server_process = FakeProcess()
         server_process.start()
 
         # Create a client to talk to the server
@@ -939,7 +960,7 @@ class IsolationContext(object):
         mod.__isolation_context__ = self
         return mod
 
-        
+
 
 
 def default_context():
@@ -959,3 +980,4 @@ def import_isolated(module_name, fromlist=[], level=-1, path=None):
     "__import__('module_name')"'''
     sys.modules[module_name] = load_module(module_name, path=path)
     return __import__(module_name, fromlist=fromlist, level=level)
+
